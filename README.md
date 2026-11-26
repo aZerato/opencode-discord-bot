@@ -60,6 +60,8 @@ OTP_SECRET=secret_base32_genere_par_setup_script
 # OpenCode
 OPENCODE_WORKSPACE_PATH=/chemin/vers/votre/projet
 LOG_FLUSH_INTERVAL_MS=3000
+# Auto-approbation des permissions d'outils OpenCode (flag `--auto` pour `opencode run`) : true (défaut) ou false
+OPENCODE_AUTO_APPROVE=true
 ```
 
 ## Commandes
