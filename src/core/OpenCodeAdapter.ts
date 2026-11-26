@@ -14,8 +14,12 @@ export interface OpenCodeQuestion {
 }
 
 export interface OpenCodeAdapterEvents {
-  /** Ligne de log produite par OpenCode. */
+  /** Ligne de log produite par OpenCode (transcript lisible, vers #logs). */
   log: (line: string) => void;
+  /** Raisonnement/réflexion du modèle (remonté dans #prompt). */
+  thinking: (text: string) => void;
+  /** Réponse textuelle du modèle, le « retour » du prompt (remonté dans #prompt). */
+  response: (text: string) => void;
   /** OpenCode demande une entrée utilisateur (validation, choix…). */
   question: (question: OpenCodeQuestion) => void;
   /** Le prompt en cours s'est terminé avec succès. */
@@ -24,26 +28,46 @@ export interface OpenCodeAdapterEvents {
   error: (err: Error) => void;
 }
 
+/** Forme minimale d'un événement du flux JSON d'`opencode run --format json`. */
+interface OpencodeStreamPart {
+  type?: string;
+  text?: string;
+  tool?: string;
+  title?: string;
+}
+interface OpencodeStreamEvent {
+  type?: string;
+  part?: OpencodeStreamPart;
+}
+
 /**
  * Interface découplée vers OpenCode : `EventEmitter` typé émettant
  * `log`, `question`, `done`, `error`.
  *
  * Deux stratégies de communication sont envisagées par l'architecture :
- *  - `CliOpenCodeAdapter` (fourni ici) : spawn du CLI, prompts écrits dans
- *    le flux `stdin`, sortie parsée ligne à ligne ;
+ *  - `CliOpenCodeAdapter` (fourni ici) : spawn du CLI, prompt passé en
+ *    argument (`opencode run <prompt>`), sortie parsée ligne à ligne ; le
+ *    `stdin` de l'enfant est scellé en `ignore` car `opencode run` bloque
+ *    sur un pipe `stdin` ouvert ;
  *  - un adaptateur API locale (WebSocket/HTTP) pourra être branché sur la
  *    même interface sans toucher au reste du pipeline.
  */
 export abstract class OpenCodeAdapter extends EventEmitter {
   /** Transmet un prompt à OpenCode (un prompt à la fois pour la variante CLI). */
   abstract submit(prompt: string): Promise<void>;
-  /** Réinjecte la réponse utilisateur dans le flux `stdin` (ou l'API). */
+  /**
+   * Transmet la réponse utilisateur à OpenCode. Pour la variante CLI one-shot
+   * c'est un no-op propre (le `stdin` est scellé en `ignore`) ; c'est le point
+   * d'ancrage de la réinjection pour la variante API.
+   */
   abstract answer(response: string): void;
   /** Arrêt propre de l'adaptateur. */
   abstract stop(): Promise<void>;
 
   // --- Abonnements typés (EventEmitter) ---
   override on(event: 'log', listener: OpenCodeAdapterEvents['log']): this;
+  override on(event: 'thinking', listener: OpenCodeAdapterEvents['thinking']): this;
+  override on(event: 'response', listener: OpenCodeAdapterEvents['response']): this;
   override on(event: 'question', listener: OpenCodeAdapterEvents['question']): this;
   override on(event: 'done', listener: OpenCodeAdapterEvents['done']): this;
   override on(event: 'error', listener: OpenCodeAdapterEvents['error']): this;
@@ -59,6 +83,15 @@ export interface CliOpenCodeAdapterOptions {
   command?: string;
   /** Arguments de base du sous-processus (défaut : `run`). */
   baseArgs?: string[];
+  /**
+   * Auto-approve des permissions d'outils OpenCode (flag `--auto`).
+   * Par défaut `true` : indispensable pour un `run` non-interactif piloté par
+   * le bot. Sans `--auto`, un prompt qui nécessite un outil (ex. écrire un
+   * fichier, lancer une commande) attend une approbation qui n'arrive jamais
+   * (pas de terminal humain) : le processus ne ferme jamais, le drapeau
+   * `busy` reste bloqué, et tout prompt suivant est refusé (« déjà occupé »).
+   */
+  autoApprove?: boolean;
   /** Motifs complémentaires de détection des questions. */
   questionPatterns?: RegExp[];
 }
@@ -109,13 +142,26 @@ export class CliOpenCodeAdapter extends OpenCodeAdapter {
         new Error('Un prompt est déjà en cours d\'exécution côté OpenCode.'),
       );
     }
+    const autoApprove = this.options.autoApprove ?? true;
     const command = this.options.command ?? 'opencode';
-    const args = [...(this.options.baseArgs ?? ['run']), prompt];
+    const args: string[] = [
+      ...(this.options.baseArgs ?? ['run']),
+      ...(autoApprove ? ['--auto'] : []),
+      // Sortie structurée (une ligne JSON par événement) + raisonnement du
+      // modèle : indispensable pour remonter réflexions/réponses dans #prompt.
+      '--format',
+      'json',
+      '--thinking',
+      prompt,
+    ];
     const child = spawn(command, args, {
       cwd: this.options.workspacePath,
       // `shell: true` est nécessaire sur Windows pour résoudre les bins `.cmd`/`.exe`.
       shell: process.platform === 'win32',
-      stdio: ['pipe', 'pipe', 'pipe'],
+      // `stdin` en `ignore` : un pipe stdin ouvert (mais jamais écrit/fermé) fait
+      // bloquer `opencode run` qui l'attend → le run ne ferme jamais, `busy`
+      // reste à `true` et tout prompt suivant est refusé (« déjà occupé »).
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
     this.child = child;
     this.busy = true;
@@ -176,25 +222,72 @@ export class CliOpenCodeAdapter extends OpenCodeAdapter {
     }
   }
 
-  /** Classifie une ligne : log simple ou question utilisateur. */
+  /**
+   * Classifie une ligne de sortie. Avec `--format json`, chaque ligne est un
+   * objet JSON typé : on en dérive les événements sémantiques
+   * (`reasoning` → réflexion, `text` → réponse ou question, `tool` → action).
+   * Une ligne non-JSON (bannière, avertissement) est journalisée telle quelle.
+   */
   private processLine(rawLine: string): void {
     const line = rawLine.trim();
     if (line === '') return;
 
-    if (this.patterns.some((pattern) => pattern.test(line))) {
+    let event: OpencodeStreamEvent;
+    try {
+      event = JSON.parse(line) as OpencodeStreamEvent;
+    } catch {
+      this.pushContext(line);
+      this.emit('log', line);
+      return;
+    }
+
+    const part = event.part;
+    if (!part) return;
+
+    switch (part.type) {
+      case 'reasoning':
+        if (part.text) {
+          this.pushContext(part.text);
+          this.emit('log', `💭 ${part.text}`);
+          this.emit('thinking', part.text);
+        }
+        return;
+      case 'text':
+        this.handleTextPart(part);
+        return;
+      case 'tool':
+        this.emit('log', `🔧 ${part.tool ?? part.title ?? 'outil'}…`);
+        return;
+      default:
+        // step-start / step-finish / inconnu : pas de log (le `done` vient du
+        // close du processus, pas du step_finish).
+        return;
+    }
+  }
+
+  /** Traite un part `text` : question utilisateur (Flux A) ou réponse. */
+  private handleTextPart(part: OpencodeStreamPart): void {
+    const text = part.text ?? '';
+    if (this.patterns.some((pattern) => pattern.test(text))) {
       const context = this.contextLines.length > 0 ? this.contextLines.join('\n') : undefined;
       this.contextLines = [];
       this.emit('question', {
         id: `q${++this.questionSeq}`,
-        question: line,
+        question: text,
         context,
-        binary: /\b(yes|no|yes\/no|y\/n|oui|non|o\/n)\b/i.test(line) && /\?\s*$/.test(line),
+        binary: /\b(yes|no|yes\/no|y\/n|oui|non|o\/n)\b/i.test(text) && /\?\s*$/.test(text),
       });
       return;
     }
 
+    this.pushContext(text);
+    this.emit('log', text);
+    this.emit('response', text);
+  }
+
+  /** Met à jour le contexte glissant (dernières lignes) pour le Flux A. */
+  private pushContext(line: string): void {
     this.contextLines.push(line);
     if (this.contextLines.length > 5) this.contextLines.shift();
-    this.emit('log', line);
   }
 }

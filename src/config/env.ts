@@ -21,6 +21,14 @@ export const appEnvSchema = z.object({
     .int()
     .min(1000, 'LOG_FLUSH_INTERVAL_MS doit être >= 1000 ms')
     .default(3000),
+  // Auto-approve des permissions d'outils OpenCode (flag `--auto`). Défaut
+  // `true` : indispensable pour un `run` non-interactif piloté par le bot,
+  // sinon un prompt qui nécessite un outil attend une approbation qui n'arrive
+  // jamais et le processus ne ferme jamais (drapeau `busy` bloqué).
+  OPENCODE_AUTO_APPROVE: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
 });
 
 export type AppEnv = z.infer<typeof appEnvSchema>;

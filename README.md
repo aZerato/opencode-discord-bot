@@ -8,6 +8,18 @@ Le bot permet de :
 - **Répondre aux questions** d'OpenCode (validations, choix…) publiées dans `#prompt` — boutons **Oui/Non** si la question est binaire, sinon réponse en citant le message.
 - **Soumettre de nouveaux prompts** depuis Discord, sous **authentification OTP** (TOTP compatible Microsoft/Google Authenticator).
 
+Vous pouvez controler votre instance opencode via discord en tapant `/prompt`,
+
+![discord](./docs/img/discord-prompt.png)
+
+Une fenêtre avec un OTP vous permettra de soumettre votre demande,
+
+![discord](./docs/img/discord-otp-prompt.png)
+
+Vous avez une idée du status de votre bot / instance dans un canal dédié,
+
+![discord](./docs/img/discord-logs.png)
+
 ## Stack
 
 Node.js v20+ · TypeScript (strict) · discord.js v14 · otplib · qrcode · zod · strip-ansi · dotenv

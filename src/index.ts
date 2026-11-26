@@ -24,8 +24,12 @@ async function main(): Promise<void> {
   log(`[Système] Démarrage du bridge OpenCode ↔ Discord (workspace: ${env.OPENCODE_WORKSPACE_PATH}).`);
 
   // OpenCode (adaptateur découplé, variante spawn CLI)
-  const adapter = new CliOpenCodeAdapter({ workspacePath: env.OPENCODE_WORKSPACE_PATH });
+  const adapter = new CliOpenCodeAdapter({
+    workspacePath: env.OPENCODE_WORKSPACE_PATH,
+    autoApprove: env.OPENCODE_AUTO_APPROVE,
+  });
   const otp = new OtpService(env.OTP_SECRET);
+  otp.assertValidSecret(); // Secret invalide → erreur explicite au démarrage
 
   // #prompt : interaction bidirectionnelle
   const promptChannel = new PromptChannelHandler({
@@ -41,6 +45,16 @@ async function main(): Promise<void> {
   adapter.on('question', (question) => {
     void promptChannel.handleQuestion(question).catch((err: unknown) => {
       log(`[ERREUR] Publication de la question: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  });
+  adapter.on('thinking', (text) => {
+    void promptChannel.handleThinking(text).catch((err: unknown) => {
+      log(`[ERREUR] Publication de la réflexion: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  });
+  adapter.on('response', (text) => {
+    void promptChannel.handleResponse(text).catch((err: unknown) => {
+      log(`[ERREUR] Publication du retour: ${err instanceof Error ? err.message : String(err)}`);
     });
   });
   adapter.on('done', () => {

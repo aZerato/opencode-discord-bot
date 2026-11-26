@@ -24,8 +24,14 @@ export class OtpService {
   /**
    * Instance dédiée à `window: 1` (le preset par défaut d'otplib utilise
    * `window: 0`, trop strict pour une horloge décalée d'un pas).
+   *
+   * On utilise `clone` (et **non** `create`) : `create` fabrique une instance
+   * « nue » qui **perd** les plugins base32 (`keyDecoder`/`createDigest`)
+   * injectés par le preset, et `check()` lèverait alors systématiquement
+   * (`Expecting options.keyDecoder to be a function.`). `clone` préserve ces
+   * plugins tout en appliquant `window: 1`.
    */
-  private readonly authenticator = authenticator.create({ window: 1 });
+  private readonly authenticator = authenticator.clone({ window: 1 });
 
   constructor(private readonly secret: string) {}
 
@@ -53,5 +59,22 @@ export class OtpService {
   /** Instant (ms) à laquelle le verrou anti brute-force se lève. */
   lockedUntil(): number {
     return this.lockedUntilMs;
+  }
+
+  /**
+   * Valide le secret au démarrage : lève une erreur **explicite** s'il n'est
+   * pas du base32 valide. Sans ça, `authenticator.check` lèverait à la volée
+   * (caractère hors base32) et ferait planter l'ACK d'une interaction Discord.
+   */
+  assertValidSecret(): void {
+    try {
+      // Un secret valide ne lève pas (le code est juste refusé) ; un secret
+      // invalide lève dans le décodeur base32.
+      this.authenticator.check('000000', this.secret);
+    } catch {
+      throw new Error(
+        'Le secret OTP est invalide. Utilisez le secret base32 généré par `npm run setup:otp` et collez-le dans OTP_SECRET (sans guillemets, sans espace).',
+      );
+    }
   }
 }

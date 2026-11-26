@@ -55,16 +55,18 @@ Discord impose des limites de débit strictes (Rate Limits). L'envoi brut des lo
 
 ### 4.2. Canal `#prompt` (Interaction Bidirectionnelle)
 
+En plus des questions et des confirmations, le canal remonte, pour **chaque prompt**, le **raisonnement du modèle** (💭 *Réflexion*) et la **réponse** (💬 *Retour*), issus des événements `thinking`/`response` de l'adaptateur. Le **transcript complet** (y compris les actions d'outils 🔧) reste dans `#logs`.
+
 #### Flux A : OpenCode pose une question à l'utilisateur (Outbound)
 1.  L'adaptateur OpenCode détecte une demande d'entrée utilisateur (ex: validation d'une commande shell, choix d'architecture).
 2.  Le bot publie un **Discord Embed** dans `#prompt` contenant le contexte et la question.
 3.  *UX améliorée :* Si la question est binaire (Oui/Non), attacher des `ActionRow` avec des boutons Discord. Sinon, attendre une réponse textuelle (`Reply`) de l'utilisateur autorisé.
-4.  La réponse de l'utilisateur est réinjectée dans le flux `stdin` ou l'API d'OpenCode.
+4.  La réponse de l'utilisateur est transmise via l'adaptateur (`answer()`). **Variante CLI** : le `run` est one-shot et non-interactif — le `stdin` de l'enfant est scellé en `ignore` (un pipe `stdin` ouvert fait bloquer `opencode run` qui l'attend : le run ne fermerait jamais et `busy` resterait coincé, refusant tout prompt suivant « déjà occupé »). La réponse est donc **acquittée** dans `#prompt` (📥) mais ne modifie pas l'exécution en cours, qui poursuit de façon autonome (`--auto`). L'interface `answer()` reste le point d'ancrage de **réinjection** pour la variante API (WebSocket/HTTP) à venir.
 
 #### Flux B : L'utilisateur soumet un nouveau prompt (Inbound + Sécurité OTP)
 L'exécution de code arbitraire via Discord représente un risque critique. L'authentification forte est obligatoire.
 
-1.  **Vérification d'identité :** Vérifier que `message.author.id === process.env.ALLOWED_DISCORD_USER_ID`. Ignorer silencieusement tout autre utilisateur.
+1.  **Vérification d'identité :** Vérifier que `message.author.id === process.env.ALLOWED_DISCORD_USER_ID`. Tout autre utilisateur est ignoré silencieusement **pour les messages classiques**. Pour un **slash command** (`/prompt`), l'interaction **doit** toujours être acquittée (sinon Discord affiche « l'application ne répond plus ») : un utilisateur non autorisé reçoit une réponse **éphémère** « ⛔ Accès refusé » à la place d'un ignore silencieux.
 2.  **Mécanisme TOTP (Microsoft Authenticator) :**
     *   **Mode Inline (Rapide) :** L'utilisateur préfixe son message avec son code à 6 chiffres : `!run [123456] Crée un composant React...` ou `123456: Crée un composant...`.
     *   **Mode Interactif (Slash Command) :** L'utilisateur tape `/prompt`, ce qui ouvre une **Discord Modal** contenant deux champs : `Code OTP (6 chiffres)` et `Instruction OpenCode`.
@@ -119,6 +121,8 @@ OTP_SECRET=secret_base32_genere_par_setup_script
 # OpenCode Configuration
 OPENCODE_WORKSPACE_PATH=/chemin/vers/votre/projet
 LOG_FLUSH_INTERVAL_MS=3000
+# Auto-approve des permissions d'outils OpenCode (flag `--auto`) : true (défaut) ou false
+OPENCODE_AUTO_APPROVE=true
 ```
 
 ---
@@ -129,4 +133,4 @@ LOG_FLUSH_INTERVAL_MS=3000
 2.  **Script Setup OTP (`src/scripts/setup-otp.ts`) :** Créer un script exécutable via `npm run setup:otp` qui génère un secret via `authenticator.generateSecret()`, construit l'URI `otpauth://totp/OpenCode:Admin?secret=...&issuer=OpenCode`, affiche le QR Code dans le terminal via `qrcode.toString(uri, { type: 'terminal' })` et affiche le secret à copier dans le `.env`.
 3.  **LogBatcher (`src/core/LogBatcher.ts`) :** Implémenter une classe utilisant `EventEmitter` ou un callback `onFlush(batch: string)`. Gérer proprement l'arrêt (`SIGINT`/`SIGTERM`) pour vider les derniers logs avant de quitter.
 4.  **Sécurité (`src/security/otpService.ts`) :** Inclure une fenêtre de tolérance de 1 pas de temps (`window: 1` dans `otplib`) pour pallier les légers décalages d'horloge, et bloquer toute tentative pendant 5 minutes après 3 échecs consécutifs.
-5.  **OpenCodeAdapter (`src/core/OpenCodeAdapter.ts`) :** Concevoir une interface découplée (`EventEmitter` émettant `'log'`, `'question'`, `'done'`, `'error'`) afin de pouvoir facilement adapter la méthode de communication avec OpenCode (spawn CLI vs API locale).
+5.  **OpenCodeAdapter (`src/core/OpenCodeAdapter.ts`) :** Concevoir une interface découplée (`EventEmitter` émettant `'log'`, `'thinking'`, `'response'`, `'question'`, `'done'`, `'error'`) afin de pouvoir facilement adapter la méthode de communication avec OpenCode (spawn CLI vs API locale). La variante CLI invoque `opencode run --auto --format json --thinking <prompt>` : **`--auto`** (auto-approve des permissions d'outils, activé par défaut et basculable via `OPENCODE_AUTO_APPROVE`) est indispensable pour un `run` **non-interactif** piloté par le bot, car sans approbation automatique un prompt qui nécessite un outil (ex. écrire un fichier) attendrait une validation qui n'arrive jamais — le processus ne fermerait jamais et le drapeau `busy` bloquerait les prompts suivants. Le **`--format json`** rend la sortie **structurée** (une ligne JSON par événement) : l'adaptateur en dérive les événements sémantiques — `reasoning` → `thinking` (réflexion du modèle), `text` → `response` (le « retour ») — à l'exception des `text` reconnus comme **question** (Flux A, détection par motifs conservée) ; `tool` → log lisible. Le **`--thinking`** est requis pour que les parties `reasoning` figurent bien dans le flux. Le **Flux A** (question Oui/Non) reste applicable aux *questions propres à OpenCode*, distinctes des permissions d'outils. Le `stdin` de l'enfant est scellé en **`ignore`** : un pipe `stdin` ouvert (jamais consommé) fait bloquer `opencode run` — le run ne ferme jamais, `busy` reste à `true` et tout prompt suivant est refusé (« déjà occupé »).

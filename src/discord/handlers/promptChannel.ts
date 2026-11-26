@@ -51,6 +51,35 @@ function statusEmbed(text: string): EmbedBuilder {
   return new EmbedBuilder().setColor(0x2f3136).setDescription(text);
 }
 
+/**
+ * Découpe un texte en morceaux de `maxLen` caractères max, en privilégiant les
+ * sauts de ligne (pour ne pas couper une phrase à mi-mot).
+ */
+function chunkText(text: string, maxLen: number): string[] {
+  const chunks: string[] = [];
+  let current = '';
+  const flush = (): void => {
+    if (current) {
+      chunks.push(current);
+      current = '';
+    }
+  };
+  for (const line of text.split('\n')) {
+    let rest = line;
+    // 1) Coupe les lignes plus longues que maxLen (pas de saut de ligne dedans).
+    while (rest.length > maxLen) {
+      flush();
+      chunks.push(rest.slice(0, maxLen));
+      rest = rest.slice(maxLen);
+    }
+    // 2) Regroupe par sauts de ligne sous la limite.
+    if (rest && (current + '\n' + rest).length > maxLen) flush();
+    current = current ? `${current}\n${rest}` : rest;
+  }
+  flush();
+  return chunks;
+}
+
 function rejectMessage(blocked: boolean, lockedUntilMs: number): string {
   if (blocked) {
     return `⛔ Authentification OTP bloquée (trop d'échecs consécutifs). Réessayez après le ${new Date(lockedUntilMs).toLocaleString('fr-FR')}.`;
@@ -147,6 +176,30 @@ export class PromptChannelHandler {
     });
   }
 
+  /** Publie le raisonnement du modèle (réflexion) dans #prompt. */
+  async handleThinking(text: string): Promise<void> {
+    await this.postConversation('💭', 0x888888, text);
+  }
+
+  /** Publie le retour (réponse du modèle) dans #prompt. */
+  async handleResponse(text: string): Promise<void> {
+    await this.postConversation('💬', 0x57f287, text);
+  }
+
+  /**
+   * Envoie un texte long (réflexion/réponse) dans #prompt, découpé en plusieurs
+   * messages si besoin (limite d'un embed : ~1024 caractères).
+   */
+  private async postConversation(emoji: string, color: number, text: string): Promise<void> {
+    const body = text.trim();
+    if (!body) return;
+    for (const chunk of chunkText(body, 1000)) {
+      await this.postPrompt({
+        embeds: [new EmbedBuilder().setColor(color).setDescription(`${emoji} ${chunk}`)],
+      });
+    }
+  }
+
   // ==================== Flux B : utilisateur → OpenCode ====================
 
   /** Point d'entrée `messageCreate` (branché par le client Discord). */
@@ -197,7 +250,16 @@ export class PromptChannelHandler {
   private async onInteraction(interaction: Interaction): Promise<void> {
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName !== PROMPT_COMMAND_NAME) return;
-      if (!this.isAllowed(interaction.user.id)) return; // ignore silencieux
+      // Un slash command DOIT être acquitté : un « ignore silencieux » (return sans
+      // réponse) ferait planter l'ACK et Discord afficherait « l'application ne
+      // répond plus ». On répond donc toujours (éphémère si non autorisé).
+      if (!this.isAllowed(interaction.user.id)) {
+        await interaction.reply({
+          content: '⛔ Accès refusé.',
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
       await interaction.showModal(buildPromptModal());
       return;
     }
@@ -228,34 +290,49 @@ export class PromptChannelHandler {
 
     if (interaction.isModalSubmit()) {
       if (interaction.customId !== PROMPT_MODAL_CUSTOM_ID) return;
-      if (!this.isAllowed(interaction.user.id)) {
-        await interaction.reply({ content: '⛔ Accès refusé.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-      const code = interaction.fields.getTextInputValue(OTP_FIELD_ID).trim();
-      const instruction = interaction.fields.getTextInputValue(INSTRUCTION_FIELD_ID).trim();
-      const result = this.deps.otp.verify(code);
-      if (!result.ok) {
+
+      // L'interaction DOIT être acquittée, sinon Discord affiche « Une erreur
+      // s'est produite. Réessayez. » et masque l'erreur réelle. On fait donc
+      // d'abord tout le travail (qui peut lever), puis on acquitte TOUJOURS,
+      // et enfin on exécute les effets de bord.
+      let payload = "❌ Une erreur interne est survenue. Réessayez.";
+      let onAccepted: (() => Promise<void>) | null = null;
+      try {
+        if (!this.isAllowed(interaction.user.id)) {
+          payload = '⛔ Accès refusé.';
+        } else {
+          const code = interaction.fields.getTextInputValue(OTP_FIELD_ID).trim();
+          const instruction = interaction.fields.getTextInputValue(INSTRUCTION_FIELD_ID).trim();
+          const result = this.deps.otp.verify(code);
+          if (!result.ok) {
+            this.deps.log(
+              `[SECURITE] Échec de vérification OTP (source: modale, utilisateur: ${interaction.user.id}).`,
+            );
+            payload = rejectMessage(result.blocked, this.deps.otp.lockedUntil());
+          } else {
+            payload = '🔐 Instruction transmise à OpenCode.';
+            onAccepted = async () => {
+              // Valide : réaction ✅ puis suppression du message (contient l'OTP).
+              const original = interaction.message;
+              if (original) {
+                await original.react('✅').catch(() => undefined);
+                await original.delete().catch(() => undefined);
+              }
+              await this.dispatchPrompt(instruction);
+            };
+          }
+        }
+      } catch (err) {
         this.deps.log(
-          `[SECURITE] Échec de vérification OTP (source: modale, utilisateur: ${interaction.user.id}).`,
+          `[ERREUR] Soumission de la modale /prompt: ${err instanceof Error ? err.message : String(err)}`,
         );
-        await interaction.reply({
-          content: rejectMessage(result.blocked, this.deps.otp.lockedUntil()),
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
       }
-      // Valide : réaction ✅ puis suppression du message modal (contient l'OTP).
-      const original = interaction.message;
-      if (original) {
-        await original.react('✅').catch(() => undefined);
-        await original.delete().catch(() => undefined);
-      }
-      await interaction.reply({
-        content: '🔐 Instruction transmise à OpenCode.',
-        flags: MessageFlags.Ephemeral,
-      });
-      await this.dispatchPrompt(instruction);
+
+      await interaction
+        .reply({ content: payload, flags: MessageFlags.Ephemeral })
+        .catch(() => undefined);
+
+      if (onAccepted) await onAccepted();
     }
   }
 
